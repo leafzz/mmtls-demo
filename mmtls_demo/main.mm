@@ -16,7 +16,7 @@
 extern "C" {
     #include "uECC.h"
     #include "openssl/hmac.h"
-
+//    #include "openssl/kdf.h"
     // micro-ecc依赖的随机数生成算法
     static int iOS_RNG(uint8_t *dest, unsigned size) {
         return SecRandomCopyBytes(kSecRandomDefault, size, dest) == 0 ? 1 : 0;
@@ -25,19 +25,29 @@ extern "C" {
 
 #define HMAC_OUT_LEN 32
 
-int opensslHmacSha256(const uint8_t *key, int key_len, const uint8_t *input, size_t input_len, uint8_t *output) {
+/**
+ 使用openssl的加密库计算hmac，使用sha265哈希算法
+
+ @param key 初始化的key
+ @param key_length key长度
+ @param input 输入的数据
+ @param input_length 输入数据的长度
+ @param output 输出，外部预分配长度`HMAC_OUT_LEN`
+ @return 1 - 成功， 0 - 失败
+ */
+int openssl_hmac_sha256(const uint8_t *key, size_t key_length, const uint8_t *input, size_t input_length, uint8_t *output) {
     assert(key != NULL);
     assert(input != NULL);
     
     const EVP_MD *md = EVP_sha256();
     HMAC_CTX ctx;
     HMAC_CTX_init(&ctx);
-    if (!HMAC_Init_ex(&ctx, key, key_len, md, NULL)) {
+    if (!HMAC_Init_ex(&ctx, key, (int)key_length, md, NULL)) {
         HMAC_CTX_cleanup(&ctx);
         return 0;
     }
     
-    if (!HMAC_Update(&ctx, input, input_len)) {
+    if (!HMAC_Update(&ctx, input, input_length)) {
         HMAC_CTX_cleanup(&ctx);
         return 0;
     }
@@ -223,7 +233,7 @@ int PSK_1_RTT(struct client_data* client, struct server_data* server) {
     memcpy(hash_data+SEC_SIZE, server->psk_server_random, SEC_SIZE);
     
     uint8_t MAC[HMAC_OUT_LEN];
-    opensslHmacSha256(server->sec_key, SEC_SIZE, hash_data, SEC_SIZE * 2, MAC);
+    openssl_hmac_sha256(server->sec_key, SEC_SIZE, hash_data, SEC_SIZE * 2, MAC);
     
     // 服务器发送server_random和MAC给客户端
     memcpy(client->psk_server_random, server->psk_server_random, SEC_SIZE);
@@ -235,7 +245,7 @@ int PSK_1_RTT(struct client_data* client, struct server_data* server) {
     memcpy(client_hash_data + SEC_SIZE, server->psk_server_random, SEC_SIZE);
 
     uint8_t verifyMAC[HMAC_OUT_LEN];
-    opensslHmacSha256(client->sec_key, SEC_SIZE, client_hash_data, SEC_SIZE * 2, verifyMAC);
+    openssl_hmac_sha256(client->sec_key, SEC_SIZE, client_hash_data, SEC_SIZE * 2, verifyMAC);
     if (memcmp(client->psk_server_mac, verifyMAC, sizeof(verifyMAC)) != 0) {
         printf("client verify MAC failed\n");
         return 0;
@@ -245,51 +255,67 @@ int PSK_1_RTT(struct client_data* client, struct server_data* server) {
     return 1;
 }
 
-int HKDF_Expand(const std::vector<uint8_t> &sec_key,
-                const std::vector<uint8_t> &info,
-                const std::vector<uint8_t> &salt,
-                std::vector<uint8_t> &output) {
-    
-    assert(sec_key.size() > 0);
+/**
+ 密钥衍生算法
+ HKDF协议的RFC：http://www.rfc-editor.org/rfc/rfc5869.txt
+ @param skm 初始密钥
+ @param skm_length 初始密钥长度
+ @param info 上下文信息
+ @param info_length 信息长度
+ @param salt 盐，可选
+ @param salt_length 盐的长度，如果salt==NULL, 长度也必须写成0
+ @param out_length 希望的输出长度
+ @param output 计算结果，预先分片至少out_length大小的空间
+ @return 1 - 成功，- 失败
+ */
+int HKDF_Expand(const uint8_t *skm, size_t skm_length,
+                const uint8_t *info, size_t info_length,
+                const uint8_t *salt, size_t salt_length,
+                size_t out_length,
+                uint8_t *output) {
+
+    assert(skm != NULL);
     
     // 先用sec_key扩充到固定长度
     uint8_t prk[HMAC_OUT_LEN];
-    if (!opensslHmacSha256(salt.size() > 0 ? &salt[0] : (uint8_t *)"", (int)salt.size(),
-                           &sec_key[0], sec_key.size(), prk)) {
+    if (!openssl_hmac_sha256(salt ? salt : (uint8_t *)"", salt_length, skm, skm_length, prk)) {
         return 0;
     }
     
-    size_t out_length = output.size();
     int iterations = (int)ceil((double)out_length/(double)HMAC_OUT_LEN);
     
     int offset = 1;
     const EVP_MD *md = EVP_sha256();
-    size_t partial_length = 0;
-    std::vector<uint8_t> stepResult;
+    size_t done_length = 0;
+    uint8_t step_result[HMAC_OUT_LEN];
     for (int i=offset; i<(iterations+offset); i++) {
-        assert(partial_length < out_length);
+        assert(done_length < out_length);
         
         HMAC_CTX ctx;
         HMAC_CTX_init(&ctx);
         HMAC_Init_ex(&ctx, &prk[0], sizeof(prk), md, NULL);
-        HMAC_Update(&ctx, &stepResult[0], stepResult.size());
-        HMAC_Update(&ctx, &info[0], info.size());
+        if (i != offset) {
+            HMAC_Update(&ctx, step_result, HMAC_OUT_LEN);
+        }
+        if (info != NULL) {
+            HMAC_Update(&ctx, info, info_length);
+        }
         unsigned char c = i;
         HMAC_Update(&ctx, &c, 1);
         
         unsigned int out_len;
-        stepResult.resize(HMAC_OUT_LEN);
-        HMAC_Final(&ctx, &stepResult[0], &out_len);
+        HMAC_Final(&ctx, step_result, &out_len);
         assert(out_len == HMAC_OUT_LEN);
-        // 检查超过output长度的情况
-        size_t copy_length = out_length - partial_length;
+        
+        // 检查超过out_length长度的情况
+        size_t copy_length = out_length - done_length;
         if (copy_length > HMAC_OUT_LEN) {
             copy_length = HMAC_OUT_LEN;
         }
-        memcpy(&output[partial_length], &stepResult[0], copy_length);
+        memcpy(output + done_length, step_result, copy_length);
         HMAC_CTX_cleanup(&ctx);
 
-        partial_length += out_len;
+        done_length += out_len;
     }
     return 1;
 }
@@ -310,50 +336,51 @@ std::vector<uint8_t> string_to_data(const std::string &str) {
 
 // 密钥的扩展和衍生
 int HKDF_Test1() {
-    std::string IKM   = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
-    std::string salt  = "000102030405060708090a0b0c";
-    std::string info  = "f0f1f2f3f4f5f6f7f8f9";
+    std::vector<uint8_t> IKM   = string_to_data("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+    std::vector<uint8_t> salt  = string_to_data("000102030405060708090a0b0c");
+    std::vector<uint8_t> info  = string_to_data("f0f1f2f3f4f5f6f7f8f9");
     int len           = 42;
     
-    std::string OKM  = "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865";
+    std::vector<uint8_t> OKM  = string_to_data("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
 
     std::vector<uint8_t> output;
     output.resize(len);
     
-    HKDF_Expand(string_to_data(IKM), string_to_data(info), string_to_data(salt), output);
-    assert(output == string_to_data(OKM));
+    HKDF_Expand(&IKM[0], IKM.size(), &info[0], info.size(), &salt[0], salt.size(), len, &output[0]);
+    assert(output == OKM);
     return 1;
 }
 
 int HKDF_Test2() {
-    std::string IKM = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f";
-    std::string salt = "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf";
-    std::string info = "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
+    std::vector<uint8_t> IKM = string_to_data("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f");
+    std::vector<uint8_t> salt = string_to_data("606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf");
+    std::vector<uint8_t> info = string_to_data("b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
     int len = 82;
     
-    std::string OKM = "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87";
+    std::vector<uint8_t> OKM = string_to_data("b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87");
     
     std::vector<uint8_t> output;
     output.resize(len);
     
-    HKDF_Expand(string_to_data(IKM), string_to_data(info), string_to_data(salt), output);
-    assert(output == string_to_data(OKM));
+    HKDF_Expand(&IKM[0], IKM.size(), &info[0], info.size(), &salt[0], salt.size(), len, &output[0]);
+    assert(output == OKM);
+
     return 1;
 }
 
 int HKDF_Test3() {
-    std::string IKM   = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
-    std::string salt    = "";
-    std::string info    = "";
+    std::vector<uint8_t> IKM   = string_to_data("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+    std::vector<uint8_t> salt    = string_to_data("");
+    std::vector<uint8_t> info    = string_to_data("");
     int len           = 42;
     
-    std::string OKM  = "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8";
+    std::vector<uint8_t> OKM  = string_to_data("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
     
     std::vector<uint8_t> output;
     output.resize(len);
     
-    HKDF_Expand(string_to_data(IKM), string_to_data(info), string_to_data(salt), output);
-    assert(output == string_to_data(OKM));
+    HKDF_Expand(&IKM[0], IKM.size(), &info[0], info.size(), &salt[0], salt.size(), len, &output[0]);
+    assert(output == OKM);
     return 1;
 }
 
