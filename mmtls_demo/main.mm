@@ -220,7 +220,8 @@ int PSK_1_RTT(struct client_data* client, struct server_data* server) {
     uint8_t decoded_sec_key[SEC_SIZE];
     simple_xor(ticket, SEC_SIZE, server->ticket_key, decoded_sec_key);
     
-    // 这一步不是必须的。
+    // decoded_sec_key应该和server->sec_key一致的
+    // 但是，通常情况下，服务器不会保存客户端的sec_key，因此需要用这个办法拿到客户端sec_key
     if (memcmp(decoded_sec_key, server->sec_key, SEC_SIZE) != 0) {
         printf("server sec_key not equal to client\n");
         return 0;
@@ -233,7 +234,7 @@ int PSK_1_RTT(struct client_data* client, struct server_data* server) {
     memcpy(hash_data+SEC_SIZE, server->psk_server_random, SEC_SIZE);
     
     uint8_t MAC[HMAC_OUT_LEN];
-    openssl_hmac_sha256(server->sec_key, SEC_SIZE, hash_data, SEC_SIZE * 2, MAC);
+    openssl_hmac_sha256(decoded_sec_key, SEC_SIZE, hash_data, SEC_SIZE * 2, MAC);
     
     // 服务器发送server_random和MAC给客户端
     memcpy(client->psk_server_random, server->psk_server_random, SEC_SIZE);
@@ -284,23 +285,22 @@ int HKDF_Expand(const uint8_t *skm, size_t skm_length,
     
     int iterations = (int)ceil((double)out_length/(double)HMAC_OUT_LEN);
     
-    int offset = 1;
     const EVP_MD *md = EVP_sha256();
     size_t done_length = 0;
     uint8_t step_result[HMAC_OUT_LEN];
-    for (int i=offset; i<(iterations+offset); i++) {
+    for (int i=0; i<iterations; i++) {
         assert(done_length < out_length);
         
         HMAC_CTX ctx;
         HMAC_CTX_init(&ctx);
         HMAC_Init_ex(&ctx, &prk[0], sizeof(prk), md, NULL);
-        if (i != offset) {
+        if (i != 0) {
             HMAC_Update(&ctx, step_result, HMAC_OUT_LEN);
         }
         if (info != NULL) {
             HMAC_Update(&ctx, info, info_length);
         }
-        unsigned char c = i;
+        unsigned char c = i+1;
         HMAC_Update(&ctx, &c, 1);
         
         unsigned int out_len;
